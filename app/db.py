@@ -15,12 +15,17 @@
   检查 + 覆盖/冲突复核 + 已分配集重写 + 版本自增”；迁移按整批同时
   迁移的语义释放全部来源、占用全部目标，目标可使用本批来源释放的
   地址，任何一步失败即整体回滚。
+* 历史快照恢复接口在单条 ``BEGIN IMMEDIATE`` 事务内完成“版本检查 +
+  历史快照存在性检查 + 快照已分配地址与当前保留区相交复核 + 已分配
+  集重写 + 版本自增”：仅把已分配地址恢复为历史快照的地址集合，当前
+  保留区保持原样；任何一步失败即整体回滚，历史快照本身从不改写。
 
 历史版本
 ========
-* 每次成功的写事务（分配提交 / 部分回收 / 整批迁移 / 保留区替换）在
-  **同一事务内**为自增后的新版本追加一份不可变快照（父网段、保留与
-  已分配 CIDR）；失败的操作整体回滚，不会留下任何版本快照；
+* 每次成功的写事务（分配提交 / 部分回收 / 整批迁移 / 保留区替换 /
+  误操作恢复）在**同一事务内**为自增后的新版本追加一份不可变快照
+  （父网段、保留与已分配 CIDR）；失败的操作整体回滚，不会留下任何
+  版本快照；
 * 旧库**首次升级**（快照表尚不存在/为空）时，在初始化阶段给当前池
   版本补存一份基线快照，此后该版本及后续版本均可查询；
 * 快照只追加、从不更新：旧版本的状态不随后续写入变化，查询时依据
@@ -108,6 +113,13 @@ class VersionDiff:
 
 class ConflictError(Exception):
     """提交冲突：池版本已变化，或方案在当前池状态下不再可用。"""
+
+
+class SnapshotNotFoundError(Exception):
+    """恢复请求引用的历史版本快照不存在（HTTP 404）。
+
+    仅表示快照表中没有该版本，绝不以当前在线池状态代替历史快照。
+    """
 
 
 class ReservationInputError(Exception):
@@ -851,6 +863,127 @@ class Database:
                 raise ConflictError(
                     f"replace reservations failed: {exc}"
                 ) from exc
+        return state
+
+    # -- 已分配地址的历史快照恢复 -----------------------------------------
+
+    def restore_allocated(
+        self,
+        expected_version: int,
+        snapshot_version: int,
+    ) -> PoolState:
+        """把**已分配地址**恢复为某个历史版本快照的地址集合。
+
+        仅重写已分配地址：当前保留区（与父网段）保持原样，快照中保存
+        的保留地址不参与恢复。恢复前在**同一写事务内**完成：
+
+        1. 版本核对：当前池版本必须等于 ``expected_version``，否则抛
+           ``ConflictError``（版本过期）；
+        2. 历史快照存在性检查：``snapshot_version`` 必须在快照表中存在，
+           否则抛 ``SnapshotNotFoundError``——绝不以当前池状态代替；
+        3. 相交复核：历史快照的已分配地址不得与**当前**保留区有任何
+           交集，否则抛 ``ConflictError``。
+
+        复核通过后，把快照已分配地址集合（先合并相交/相邻区间）重写为
+        覆盖范围相同且**数量最少**的规范 CIDR，删除并整体重写全部
+        allocated 行、自增版本，并在同一事务内为新版本追加不可变快照。
+        任何一步失败即整体回滚，池状态、版本与历史快照均不变。返回写
+        事务内读取的新状态。
+        """
+        with self._conn() as conn:
+            try:
+                # 立即获取写锁，与并发提交/回收/迁移/替换/恢复互斥。
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT parent_cidr, version FROM pool_meta WHERE id = 1"
+                ).fetchone()
+                parent = ipaddress.ip_network(row["parent_cidr"], strict=True)
+                current_version = row["version"]
+                if current_version != expected_version:
+                    conn.rollback()
+                    raise ConflictError(
+                        f"pool version changed: expected {expected_version}, "
+                        f"current {current_version}"
+                    )
+
+                # 历史快照必须真实存在；缺失即 404，不能用当前状态代替。
+                snap_meta = conn.execute(
+                    "SELECT parent_cidr FROM pool_versions "
+                    "WHERE version = ?",
+                    (snapshot_version,),
+                ).fetchone()
+                if snap_meta is None:
+                    conn.rollback()
+                    raise SnapshotNotFoundError(
+                        f"unknown pool version snapshot: {snapshot_version}"
+                    )
+
+                snap_rows = conn.execute(
+                    "SELECT cidr, kind FROM pool_version_subnets "
+                    "WHERE version = ?",
+                    (snapshot_version,),
+                ).fetchall()
+                snapshot_allocated = [
+                    ipaddress.ip_network(r["cidr"], strict=True)
+                    for r in snap_rows
+                    if r["kind"] == "allocated"
+                ]
+                # 当前保留区保持原样，只读取用于相交复核与恢复后状态。
+                current_reserved = [
+                    ipaddress.ip_network(r["cidr"], strict=True)
+                    for r in conn.execute(
+                        "SELECT cidr FROM subnets WHERE kind = 'reserved'"
+                    ).fetchall()
+                ]
+
+                # 历史已分配地址与当前保留区不得有任何交集。
+                collisions = [
+                    str(net)
+                    for net in snapshot_allocated
+                    if any(net.overlaps(res) for res in current_reserved)
+                ]
+                if collisions:
+                    conn.rollback()
+                    raise ConflictError(
+                        f"snapshot {snapshot_version} allocated addresses "
+                        f"overlap current reservations: {collisions}"
+                    )
+
+                # 规范化为覆盖范围相同且数量最少的规范 CIDR：快照中相邻
+                # 的多条记录会被合并（空快照得到空集合）。
+                snap_ranges = _collapse_ranges(
+                    [_network_bounds(net) for net in snapshot_allocated]
+                )
+                new_allocated = [
+                    ipaddress.ip_network((s, p), strict=True)
+                    for s, p in _ranges_to_cidrs(
+                        parent.max_prefixlen, snap_ranges
+                    )
+                ]
+
+                # 整体重写已分配记录：删除全部 allocated 行后写回规范化
+                # 结果；reserved 行原样保留。
+                conn.execute("DELETE FROM subnets WHERE kind = 'allocated'")
+                conn.executemany(
+                    "INSERT INTO subnets (cidr, kind) "
+                    "VALUES (?, 'allocated')",
+                    [(str(net),) for net in new_allocated],
+                )
+                conn.execute(
+                    "UPDATE pool_meta SET version = version + 1 WHERE id = 1"
+                )
+                # 与其它写操作相同：在同一写事务内读取恢复后的状态。
+                state = self._load_state(conn)
+                # 新版本快照与本次写入同一事务追加；历史快照本身不改写。
+                # 快照插入失败同样整体回滚，失败操作不生成任何版本。
+                self._insert_snapshot(conn, state)
+                conn.commit()
+                self._after_commit(conn)
+            except (ConflictError, SnapshotNotFoundError):
+                raise
+            except sqlite3.Error as exc:
+                conn.rollback()
+                raise ConflictError(f"restore failed: {exc}") from exc
         return state
 
 

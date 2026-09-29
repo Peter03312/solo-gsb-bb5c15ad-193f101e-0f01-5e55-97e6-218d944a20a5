@@ -1,4 +1,4 @@
-"""FastAPI 接口：池状态/历史版本查询、两版本地址用途比较、预演与原子提交、部分回收、整批迁移与保留区替换。"""
+"""FastAPI 接口：池状态/历史版本查询、两版本地址用途比较、预演与原子提交、部分回收、整批迁移、保留区替换与已分配地址的历史快照恢复。"""
 from __future__ import annotations
 
 import ipaddress
@@ -16,6 +16,7 @@ from .db import (
     PoolState,
     RelocateInputError,
     ReservationInputError,
+    SnapshotNotFoundError,
 )
 
 _db: Database | None = None
@@ -242,6 +243,27 @@ class ReplaceReservationsResponse(BaseModel):
     free_cidrs: list[str]
 
 
+class RestoreRequest(BaseModel):
+    pool_version: int = Field(
+        ...,
+        ge=1,
+        description="当前池版本号（乐观并发控制）。",
+    )
+    snapshot_version: int = Field(
+        ...,
+        ge=1,
+        description="要恢复到的已保存历史版本号；其快照必须真实存在。",
+    )
+
+
+class RestoreResponse(BaseModel):
+    status: Literal["restored"]
+    pool_version: int
+    restored_from_version: int
+    allocated_cidrs: list[str]
+    free_cidrs: list[str]
+
+
 class VersionDiffResponse(BaseModel):
     from_version: int = Field(..., description="比较起点版本号（旧快照）。")
     to_version: int = Field(..., description="比较终点版本号（新快照）。")
@@ -313,8 +335,9 @@ def get_pool_version(
     返回该版本保存时的父网段、保留与已分配 CIDR，以及依据该快照计算
     的空闲 CIDR。快照只追加、从不更新：旧版本的状态不随后续写入变化。
     数据库首次升级时会给当前池版本补存基线快照，此后每次成功的提交 /
-    回收 / 迁移 / 保留区替换都会在各自写事务内生成新版本快照；失败的
-    操作不生成版本。未知版本（含基线之前不存在的版本号）返回 404。
+    回收 / 迁移 / 保留区替换 / 误操作恢复都会在各自写事务内生成新版本
+    快照；失败的操作不生成版本。未知版本（含基线之前不存在的版本号）
+    返回 404。
     """
     state = db.get_state_version(version)
     if state is None:
@@ -520,6 +543,45 @@ def relocate(
         status="relocated",
         pool_version=state.version,
         moves=body.moves,
+        allocated_cidrs=[str(n) for n in state.allocated],
+        free_cidrs=[str(n) for n in free],
+    )
+
+
+@app.post(
+    "/api/allocations/restore",
+    response_model=RestoreResponse,
+    tags=["allocations"],
+)
+def restore_allocations(
+    body: RestoreRequest, db: Database = Depends(get_db)
+) -> RestoreResponse:
+    """误操作回滚：把已分配地址恢复为某个历史版本快照的地址集合。
+
+    仅恢复**已分配地址**，当前保留区保持原样（历史快照中的保留地址
+    不参与恢复）。在同一 SQLite 写事务内：核对当前池版本、检查历史
+    快照是否存在、复核历史已分配地址是否与当前保留区相交，任一不满足
+    即整体回滚——版本过期或地址相交返回 `409 Conflict`，池与版本均
+    不变；历史版本不存在返回 `404 Not Found`，绝不以当前状态代替。
+
+    复核通过后把快照已分配地址集合规范化为数量最少的规范 CIDR，整体
+    重写已分配记录并自增版本、为新版本追加不可变快照（被引用的历史
+    快照本身不变）。成功后查询、预演、提交及其它写入立即看到恢复后的
+    状态。
+    """
+    try:
+        state = db.restore_allocated(
+            body.pool_version, body.snapshot_version
+        )
+    except SnapshotNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    free, _ = _free_cidrs(state)
+    return RestoreResponse(
+        status="restored",
+        pool_version=state.version,
+        restored_from_version=body.snapshot_version,
         allocated_cidrs=[str(n) for n in state.allocated],
         free_cidrs=[str(n) for n in free],
     )
