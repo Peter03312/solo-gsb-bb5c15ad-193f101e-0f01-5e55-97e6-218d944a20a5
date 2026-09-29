@@ -1,4 +1,4 @@
-"""FastAPI 接口：池状态/历史版本查询、两版本地址用途比较、预演与原子提交、部分回收、整批迁移与保留区替换。"""
+"""FastAPI 接口：池状态/历史版本查询、两版本地址用途比较、预演与原子提交、部分回收、整批迁移、保留区替换与误操作恢复。"""
 from __future__ import annotations
 
 import ipaddress
@@ -16,6 +16,7 @@ from .db import (
     PoolState,
     RelocateInputError,
     ReservationInputError,
+    SnapshotNotFoundError,
 )
 
 _db: Database | None = None
@@ -239,6 +240,23 @@ class ReplaceReservationsResponse(BaseModel):
     status: Literal["replaced"]
     pool_version: int
     reserved_cidrs: list[str]
+    free_cidrs: list[str]
+
+
+class RestoreRequest(BaseModel):
+    pool_version: int = Field(
+        ..., ge=1, description="当前池版本号（乐观并发控制）。"
+    )
+    snapshot_version: int = Field(
+        ..., ge=1, description="要恢复已分配地址的已保存历史版本号。"
+    )
+
+
+class RestoreResponse(BaseModel):
+    status: Literal["restored"]
+    pool_version: int
+    restored_from_version: int
+    allocated_cidrs: list[str]
     free_cidrs: list[str]
 
 
@@ -520,6 +538,42 @@ def relocate(
         status="relocated",
         pool_version=state.version,
         moves=body.moves,
+        allocated_cidrs=[str(n) for n in state.allocated],
+        free_cidrs=[str(n) for n in free],
+    )
+
+
+@app.post(
+    "/api/allocations/restore",
+    response_model=RestoreResponse,
+    tags=["allocations"],
+)
+def restore(
+    body: RestoreRequest, db: Database = Depends(get_db)
+) -> RestoreResponse:
+    """误操作恢复：仅把已分配地址恢复为某历史版本快照的地址集合。
+
+    当前保留区保持原样，只有已分配地址被重写为历史快照中的地址集合
+    （恢复后规范化为数量最少的规范 CIDR）。当前版本核对、历史快照
+    读取、历史已分配地址与当前保留区的相交复核、重写与版本自增全部在
+    单个 SQLite 写事务内完成：当前版本已过期或历史已分配地址与当前
+    保留区相交时返回 409，池与版本均不变；历史版本不存在返回 404，
+    绝不以当前状态代替。成功时生成一个新版本及其不可变快照，历史快照
+    本身不改变；恢复结果立即被查询、预演、提交及其它写入看到。
+    """
+    try:
+        state = db.restore_allocated(
+            body.pool_version, body.snapshot_version
+        )
+    except SnapshotNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    free, _ = _free_cidrs(state)
+    return RestoreResponse(
+        status="restored",
+        pool_version=state.version,
+        restored_from_version=body.snapshot_version,
         allocated_cidrs=[str(n) for n in state.allocated],
         free_cidrs=[str(n) for n in free],
     )

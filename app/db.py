@@ -15,12 +15,17 @@
   检查 + 覆盖/冲突复核 + 已分配集重写 + 版本自增”；迁移按整批同时
   迁移的语义释放全部来源、占用全部目标，目标可使用本批来源释放的
   地址，任何一步失败即整体回滚。
+* 误操作恢复接口同样在单条 ``BEGIN IMMEDIATE`` 事务内完成“当前版本
+  核对 + 历史快照读取（缺失即回滚，绝不以当前状态代替）+ 历史已分配
+  地址与当前保留区的相交复核 + 已分配集重写 + 版本自增”；保留区
+  不参与重写，始终保持当前状态，任何一步失败即整体回滚。
 
 历史版本
 ========
-* 每次成功的写事务（分配提交 / 部分回收 / 整批迁移 / 保留区替换）在
-  **同一事务内**为自增后的新版本追加一份不可变快照（父网段、保留与
-  已分配 CIDR）；失败的操作整体回滚，不会留下任何版本快照；
+* 每次成功的写事务（分配提交 / 部分回收 / 整批迁移 / 保留区替换 /
+  误操作恢复）在**同一事务内**为自增后的新版本追加一份不可变快照
+  （父网段、保留与已分配 CIDR）；失败的操作整体回滚，不会留下任何
+  版本快照；
 * 旧库**首次升级**（快照表尚不存在/为空）时，在初始化阶段给当前池
   版本补存一份基线快照，此后该版本及后续版本均可查询；
 * 快照只追加、从不更新：旧版本的状态不随后续写入变化，查询时依据
@@ -116,6 +121,10 @@ class ReservationInputError(Exception):
 
 class RelocateInputError(Exception):
     """迁移端点非法：来源/目标越出父网段或地址族与父网段不一致（HTTP 422）。"""
+
+
+class SnapshotNotFoundError(Exception):
+    """历史版本快照不存在（HTTP 404）；绝不以当前池状态代替。"""
 
 
 def _connect(db_path: str) -> sqlite3.Connection:
@@ -851,6 +860,130 @@ class Database:
                 raise ConflictError(
                     f"replace reservations failed: {exc}"
                 ) from exc
+        return state
+
+    # -- 误操作恢复：把已分配地址恢复为历史快照的地址集合 ---------------
+
+    def restore_allocated(
+        self,
+        expected_version: int,
+        snapshot_version: int,
+    ) -> PoolState:
+        """把**已分配地址**恢复为某个已保存历史版本快照的地址集合。
+
+        仅重写已分配地址：保留区始终保持**当前**状态不参与重写。在单条
+        ``BEGIN IMMEDIATE`` 事务内按顺序完成：
+
+        1. 当前版本核对：``pool_meta.version`` 必须等于
+           ``expected_version``，否则抛 :class:`ConflictError`（版本过期）；
+        2. 历史快照读取：``snapshot_version`` 必须在快照表中存在，且其
+           父网段与当前池一致，否则抛 :class:`SnapshotNotFoundError`
+           （历史版本不存在，绝不以当前池状态代替）；
+        3. 相交复核：历史快照的已分配地址不得与**当前**保留区相交
+           （按地址集合判断，记录边界无关），否则抛
+           :class:`ConflictError`；
+        4. 把历史已分配地址合并区间后重写为覆盖范围相同且数量最少的
+           规范 CIDR，删除全部当前 allocated 行并写回，版本自增，并在
+           同一事务内为新版本追加不可变快照。
+
+        任何一步失败（含快照写入失败）即整体回滚，池状态与版本均不变。
+        历史快照只读取、绝不修改：恢复后原 ``snapshot_version`` 的内容
+        保持原样。允许恢复到与当前已分配集合相同的快照（占用集不变，
+        仍生成新版本）。返回写事务内读取的新状态。
+        """
+        with self._conn() as conn:
+            try:
+                # 立即获取写锁，与并发提交/回收/迁移/替换/恢复互斥。
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT parent_cidr, version FROM pool_meta WHERE id = 1"
+                ).fetchone()
+                parent = ipaddress.ip_network(row["parent_cidr"], strict=True)
+                current_version = row["version"]
+                if current_version != expected_version:
+                    conn.rollback()
+                    raise ConflictError(
+                        f"pool version changed: expected {expected_version}, "
+                        f"current {current_version}"
+                    )
+
+                # 历史快照必须在同一写事务内读取：与下面的相交复核、重写
+                # 针对同一状态快照。快照缺失直接 404，绝不以当前池代替。
+                snap_meta = conn.execute(
+                    "SELECT parent_cidr FROM pool_versions "
+                    "WHERE version = ?",
+                    (snapshot_version,),
+                ).fetchone()
+                if snap_meta is None or snap_meta["parent_cidr"] != str(parent):
+                    conn.rollback()
+                    raise SnapshotNotFoundError(
+                        f"unknown pool version snapshot: {snapshot_version}"
+                    )
+                snap_rows = conn.execute(
+                    "SELECT cidr FROM pool_version_subnets "
+                    "WHERE version = ? AND kind = 'allocated'",
+                    (snapshot_version,),
+                ).fetchall()
+                historical_allocated = [
+                    ipaddress.ip_network(r["cidr"], strict=True)
+                    for r in snap_rows
+                ]
+
+                # 当前保留区保持原样，但历史已分配地址不得与之相交。
+                reserved = [
+                    ipaddress.ip_network(r["cidr"], strict=True)
+                    for r in conn.execute(
+                        "SELECT cidr FROM subnets WHERE kind = 'reserved'"
+                    ).fetchall()
+                ]
+                collisions = [
+                    str(net)
+                    for net in historical_allocated
+                    if any(net.overlaps(other) for other in reserved)
+                ]
+                if collisions:
+                    conn.rollback()
+                    raise ConflictError(
+                        f"historical allocated addresses of version "
+                        f"{snapshot_version} overlap current reservations: "
+                        f"{collisions}"
+                    )
+
+                # 历史已分配地址规范化：合并相交/相邻区间后贪心切出最大
+                # 对齐块，得到覆盖同一地址集合且数量最少的规范 CIDR；
+                # 空集合（历史版本没有任何已分配地址）得到空列表。
+                restored_ranges = _collapse_ranges(
+                    [_network_bounds(net) for net in historical_allocated]
+                )
+                new_allocated = [
+                    ipaddress.ip_network((s, p), strict=True)
+                    for s, p in _ranges_to_cidrs(
+                        parent.max_prefixlen, restored_ranges
+                    )
+                ]
+
+                # 仅重写已分配记录：保留记录原样保留。
+                conn.execute("DELETE FROM subnets WHERE kind = 'allocated'")
+                conn.executemany(
+                    "INSERT INTO subnets (cidr, kind) "
+                    "VALUES (?, 'allocated')",
+                    [(str(net),) for net in new_allocated],
+                )
+                conn.execute(
+                    "UPDATE pool_meta SET version = version + 1 WHERE id = 1"
+                )
+                # 与其余写操作相同：在同一写事务内读取恢复后的状态。
+                state = self._load_state(conn)
+                # 与本次写入同一事务追加版本快照：失败时整体回滚，失败
+                # 操作不生成任何版本；被恢复的历史快照本身不被修改。
+                self._insert_snapshot(conn, state)
+                conn.commit()
+                self._after_commit(conn)
+            except (ConflictError, SnapshotNotFoundError):
+                raise
+            except sqlite3.Error as exc:
+                conn.rollback()
+                raise ConflictError(f"restore failed: {exc}") from exc
         return state
 
 
